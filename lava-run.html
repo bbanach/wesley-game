@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Floor is Lava</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0d0303; display:flex; align-items:center; justify-content:center; min-height:100vh; font-family:'Courier New',monospace; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="gc"></canvas>
+<script>
+'use strict';
+// ── SETUP ───────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('gc');
+const ctx    = canvas.getContext('2d');
+const W = 900, H = 560;
+canvas.width = W; canvas.height = H;
+
+// ── CONSTANTS ────────────────────────────────────────────────────────────────
+const GRAV           = 0.58;
+const MAX_FALL       = 18;
+const JUMP_V         = -13.8;
+const BOUNCE_V       = -21;
+const WALL_JUMP_VX   = 8.5;
+const WALK           = 4.6;
+const SPRINT         = 8.2;
+const WALL_SLIDE_SPD = 1.8;
+const STAMINA_DRAIN  = 50;   // per second
+const STAMINA_REGEN  = 20;   // per second
+const COYOTE_T       = 0.12;
+const JUMP_BUF_T     = 0.14;
+const LAVA_TOP       = H - 58;
+
+// ── INPUT ────────────────────────────────────────────────────────────────────
+const K  = {};
+const KP = {}; // just-pressed this frame
+addEventListener('keydown', e => {
+  if (!K[e.code]) KP[e.code] = true;
+  K[e.code] = true;
+  if (!e.metaKey && !e.ctrlKey) e.preventDefault();
+});
+addEventListener('keyup',   e => { delete K[e.code]; });
+
+const isLeft   = () => K.ArrowLeft  || K.KeyA;
+const isRight  = () => K.ArrowRight || K.KeyD;
+const isDown   = () => K.ArrowDown  || K.KeyS;
+const isSprint = () => K.ShiftLeft  || K.ShiftRight;
+const jumpPr   = () => KP.Space || KP.ArrowUp || KP.KeyW;
+const jumpHeld = () => K.Space  || K.ArrowUp  || K.KeyW;
+
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+const lerp   = (a,b,t) => a + (b-a) * Math.max(0, Math.min(1, t));
+const rnd    = (a,b)   => Math.random() * (b-a) + a;
+const clamp  = (v,a,b) => Math.max(a, Math.min(b, v));
+const ov     = (ax,ay,aw,ah, bx,by,bw,bh) =>
+  ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+
+// ── STATE ────────────────────────────────────────────────────────────────────
+let gState = 'menu'; // menu | playing | dying | levelComplete | gameOver
+let lives = 3, levelNum = 1, levelsCleared = 0;
+let camX = 0, lvlWidth = 0, endPlatX = 0;
+let gTime = 0;
+let dyingTimer = 0, lvlTimer = 0;
+let particles = [];
+let spawnX = 185, spawnY = 310;
+
+// ── PLAYER ───────────────────────────────────────────────────────────────────
+const FULL_H   = 44;
+const CROUCH_H = 20;
+const P = {
+  x:0, y:0, vx:0, vy:0,
+  w:26, h:FULL_H,
+  onGround: false,
+  groundPlat: null,
+  wallL: false, wallR: false,
+  stamina: 100,
+  coyoteT: 0,
+  jumpBufT: 0,
+  facingR: true,
+  onSlope: false, slopeObj: null,
+  crouching: false,
+  dead: false
+};
+
+// ── LEVEL DATA ────────────────────────────────────────────────────────────────
+let platforms = [];
+let slopes    = [];
+let smashers  = [];
+let spikers   = [];
+let walls     = [];
+let wMonster  = null;
+
+// ── LEVEL GENERATION ─────────────────────────────────────────────────────────
+function mkPlat(x,y,w,h,type) {
+  return { x,y,w,h,type,
+    sinkT:0, sinkDelay:0.5, occupied:false, origY:y, sunk:false, shakeX:0,
+    bouncedT:0 };
+}
+function mkSlope(x,y,w,h,dir) {
+  return { x,y,w,h,dir };
+}
+
+function respawnPlayer() {
+  Object.assign(P, {
+    x:spawnX, y:spawnY, vx:0, vy:0,
+    onGround:false, groundPlat:null, wallL:false, wallR:false,
+    stamina:100, coyoteT:0, jumpBufT:0,
+    dead:false, facingR:true, onSlope:false, slopeObj:null,
+    crouching:false, h:FULL_H
+  });
+  camX = 0;
+  particles = [];
+}
+
+function spawnLevel(lvl) {
+  platforms=[]; slopes=[]; smashers=[]; spikers=[]; walls=[]; wMonster=null; particles=[];
+  const diff = Math.min((lvl-1)/9, 1);
+  lvlWidth = 3600 + lvl*550;
+  endPlatX  = lvlWidth - 300;
+
+  platforms.push(mkPlat(60,  370, 290, 22, 'static'));
+  platforms.push(mkPlat(endPlatX, 345, 270, 22, 'end'));
+
+  let cx = 390, lastY = 370;
+  while (cx < endPlatX - 130) {
+    const gap = clamp(rnd(85,175) + lvl*7, 85, 290);
+    cx += gap;
+    if (cx >= endPlatX - 100) break;
+    const pY = clamp(lastY + rnd(-110, 85), 155, LAVA_TOP - 70);
+
+    // Wall-jump corridor: 2-3 walls in a gap, no platform, requires wall jumping
+    if (Math.random() < 0.12 + diff*0.08 && lvl >= 2 && cx + 300 < endPlatX) {
+      const numWalls = rndInt(2, 3);
+      for (let wi=0; wi<numWalls; wi++) {
+        const wh = rnd(100, 170);
+        const wx = cx + wi * rnd(60, 82);
+        const wy = clamp(lastY - rnd(50, 150), 60, LAVA_TOP - wh - 10);
+        walls.push({ x:wx, y:wy, w:20, h:wh });
+      }
+      cx += numWalls * 72; lastY = pY;
+      continue;
+    }
+
+    // Slope section (always down-right)
+    if (Math.random() < 0.11 && cx + 220 < endPlatX - 160) {
+      const sw = rnd(140, 210), sh = rnd(55, 90);
+      slopes.push(mkSlope(cx, pY - sh, sw, sh, 'dr'));
+      lastY = pY; cx += sw;
+      continue;
+    }
+
+    // Platform type
+    let type = 'static';
+    const r = Math.random();
+    if      (r < 0.07 + diff*0.22) type = 'sinking';
+    else if (r < 0.13 + diff*0.26) type = 'bouncy';
+
+    const pw = Math.max(55, rnd(95,185) - lvl*4);
+    platforms.push(mkPlat(cx, pY, pw, 22, type));
+    lastY = pY; cx += pw;
+
+    // Smasher: encloses a platform — player can jump inside, must escape before it closes
+    if (Math.random() < 0.06 + diff*0.14 && lvl >= 2 && cx+320 < endPlatX) {
+      const smCx = cx + 120;
+      const smH  = 200;
+      const smY  = clamp(lastY - 160, 80, LAVA_TOP - smH - 30);
+      smashers.push(new Smasher(smCx, smY, smH));
+      // Platform sitting at the bottom inside the passage
+      platforms.push(mkPlat(smCx - 65, smY + smH - 24, 130, 22, 'static'));
+      cx += 60;
+    }
+
+    // Vertical wall obstacle — sometimes a pair for wall jumping
+    if (Math.random() < 0.28 + diff*0.12) {
+      const wh = rnd(70, 155);
+      const wx = cx - rnd(30, 80);
+      const wy = Math.random() < 0.5
+        ? lastY - wh
+        : clamp(lastY - rnd(120, 220), 80, LAVA_TOP - wh - 10);
+      walls.push({ x:wx, y:wy, w:20, h:wh });
+      // Pair: second wall nearby for wall-jump bouncing
+      if (Math.random() < 0.55) {
+        const gap2 = rnd(58, 82);
+        const wh2  = rnd(80, 155);
+        const wy2  = clamp(wy + rnd(-25, 25), 60, LAVA_TOP - wh2 - 10);
+        walls.push({ x:wx + 20 + gap2, y:wy2, w:20, h:wh2 });
+      }
+    }
+
+    // Spikey ceiling
+    if (Math.random() < 0.08 + diff*0.09 && lvl >= 2) {
+      spikers.push({ x: cx - rnd(60,120), y: rnd(45,155), w: rnd(70,145), h: 18 });
+    }
+  }
+
+  // Wall monster (level 3+)
+  if (lvl >= 3 && Math.random() < 0.4 + diff*0.45) {
+    wMonster = {
+      x: -220, w: 85, speed: 78 + lvl*13,
+      active:false, activateAt: 5 - Math.min(lvl*0.3,2),
+      timer:0, warned:false, warningT:0
+    };
+  }
+
+  spawnX = 185; spawnY = 300;
+  gTime = 0;
+  respawnPlayer();
+}
+
+// ── SMASHER ──────────────────────────────────────────────────────────────────
+class Smasher {
+  constructor(cx, y, h) {
+    this.cx=cx; this.y=y; this.h=h;
+    this.openGap=215; this.gap=215; this.minGap=14;
+    this.state='open'; this.timer=0;
+    this.dur={ open:3.2, closing:1.1, closed:0.9, opening:0.85 };
+    this.blockW=115;
+  }
+  update(dt) {
+    this.timer += dt;
+    const d = this.dur[this.state];
+    if (this.timer >= d) {
+      this.timer -= d;
+      this.state = {open:'closing',closing:'closed',closed:'opening',opening:'open'}[this.state];
+    }
+    const prog = this.timer / this.dur[this.state];
+    if      (this.state==='closing') this.gap = lerp(this.openGap, this.minGap, prog);
+    else if (this.state==='opening') this.gap = lerp(this.minGap, this.openGap, prog);
+    else if (this.state==='closed')  this.gap = this.minGap;
+    else                             this.gap = this.openGap;
+  }
+  lbRect() {
+    const ext=(this.openGap-this.gap)/2;
+    return { x:this.cx-this.openGap/2-this.blockW, y:this.y, w:this.blockW+ext, h:this.h };
+  }
+  rbRect() {
+    const ext=(this.openGap-this.gap)/2;
+    return { x:this.cx+this.gap/2, y:this.y, w:this.blockW+ext, h:this.h };
+  }
+  dangerous() { return this.state==='closed' || (this.state==='closing' && this.gap < 32); }
+  crushesPlayer() {
+    if (!this.dangerous()) return false;
+    const lb=this.lbRect(), rb=this.rbRect();
+    return ov(P.x,P.y,P.w,P.h, lb.x,lb.y,lb.w,lb.h)
+        || ov(P.x,P.y,P.w,P.h, rb.x,rb.y,rb.w,rb.h);
+  }
+  draw() {
+    const lb=this.lbRect(), rb=this.rbRect();
+    const dang=this.dangerous();
+    // Blocks
+    ctx.fillStyle = dang ? '#7a0000' : '#3a3558';
+    ctx.fillRect(lb.x-camX, lb.y, lb.w, lb.h);
+    ctx.fillRect(rb.x-camX, rb.y, rb.w, rb.h);
+    // Glowing inner edges
+    ctx.fillStyle = dang ? '#ff2200' : '#6a62a0';
+    ctx.fillRect(lb.x-camX+lb.w-5, lb.y, 5, lb.h);
+    ctx.fillRect(rb.x-camX,         rb.y, 5, rb.h);
+    // Bolt decorations
+    const boltCol = dang ? '#ff6600' : '#8880b0';
+    ctx.fillStyle = boltCol;
+    for (let i=0; i<Math.floor(lb.h/40); i++) {
+      ctx.fillRect(lb.x-camX+10, lb.y+15+i*40, 8, 8);
+      ctx.fillRect(rb.x-camX+rb.w-18, rb.y+15+i*40, 8, 8);
+    }
+    // Warning pulse in gap before closing
+    if (this.state==='open' && this.timer > this.dur.open*0.55) {
+      const a = ((this.timer-this.dur.open*0.55)/(this.dur.open*0.45))*0.7;
+      ctx.fillStyle = `rgba(255,80,0,${a*0.35})`;
+      ctx.fillRect(this.cx-camX-this.gap/2, this.y, this.gap, this.h);
+      // Arrow indicators
+      ctx.fillStyle = `rgba(255,140,0,${a})`;
+      ctx.font = 'bold 18px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText('⬅  ➡', this.cx-camX, this.y+this.h/2+6);
+    }
+  }
+}
+
+// ── SLOPE HELPERS ─────────────────────────────────────────────────────────────
+function slopeSurfY(sl, wx) {
+  const t = clamp((wx-sl.x)/sl.w, 0, 1);
+  return sl.dir==='dr' ? sl.y + t*sl.h : sl.y + (1-t)*sl.h;
+}
+
+// ── PARTICLES ────────────────────────────────────────────────────────────────
+function spawnParts(x, y, n, col) {
+  for (let i=0; i<n; i++) {
+    particles.push({ x, y, vx:rnd(-3,3), vy:rnd(-5,-0.5),
+      life:rnd(0.35,0.8), maxLife:0.8, col, sz:rnd(3,7) });
+  }
+}
+function updateParts(dt) {
+  for (let i=particles.length-1; i>=0; i--) {
+    const p=particles[i];
+    p.vy += GRAV*0.4; p.x+=p.vx; p.y+=p.vy; p.life-=dt;
+    if (p.life<=0) particles.splice(i,1);
+  }
+}
+function drawParts() {
+  particles.forEach(p => {
+    ctx.globalAlpha = clamp(p.life/p.maxLife, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(p.x-camX-p.sz/2, p.y-p.sz/2, p.sz, p.sz);
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ── PHYSICS ──────────────────────────────────────────────────────────────────
+function updatePhysics(dt) {
+  if (P.dead) return;
+  const TICK = dt * 60;
+
+  // Stamina
+  const wantSprint = isSprint() && (isLeft()||isRight()) && P.stamina > 0;
+  if (wantSprint) P.stamina = clamp(P.stamina - STAMINA_DRAIN*dt, 0, 100);
+  else            P.stamina = clamp(P.stamina + STAMINA_REGEN*dt, 0, 100);
+
+  const spd = wantSprint ? SPRINT : WALK;
+
+  // Crouch: shrink height so player can squeeze under tight gaps
+  const wantCrouch = isDown() && !P.onSlope;
+  if (wantCrouch && !P.crouching) {
+    P.y += FULL_H - CROUCH_H; // feet stay in place, top rises
+    P.h = CROUCH_H;
+    P.crouching = true;
+  } else if (!wantCrouch && P.crouching) {
+    // Only stand if no ceiling directly above
+    const newY = P.y - (FULL_H - CROUCH_H);
+    const blocked = [...platforms.filter(p=>!p.sunk), ...walls]
+      .some(ob => ov(P.x+2, newY, P.w-4, FULL_H, ob.x, ob.y, ob.w, ob.h));
+    if (!blocked) { P.y = newY; P.h = FULL_H; P.crouching = false; }
+  }
+
+  // Jump buffer
+  if (jumpPr()) P.jumpBufT = JUMP_BUF_T;
+
+  // Horizontal
+  let targetVx = 0;
+  if (isLeft())  { targetVx = -spd; P.facingR = false; }
+  if (isRight()) { targetVx = +spd; P.facingR = true;  }
+
+  // Slope slide: automatic boost when going downhill (rightward on 'dr' slopes)
+  if (P.onSlope && targetVx >= 0) {
+    targetVx = WALK + 4;
+    P.stamina = clamp(P.stamina + STAMINA_REGEN*dt, 0, 100);
+    P.facingR = true;
+  }
+  P.vx = targetVx;
+
+  // Gravity
+  P.vy = Math.min(P.vy + GRAV*TICK, MAX_FALL);
+
+  // Wall slide: slow fall while pressed into wall
+  if (!P.onGround && P.vy > WALL_SLIDE_SPD) {
+    if ((P.wallL && isLeft()) || (P.wallR && isRight())) {
+      P.vy = WALL_SLIDE_SPD;
+    }
+  }
+
+  // Variable jump height: cut vy short when jump released
+  if (!jumpHeld() && P.vy < -5) P.vy += 1.1 * TICK;
+
+  // Was on ground last frame (for coyote)
+  const wasGround = P.onGround;
+
+  // Reset collision state
+  const prevGroundPlat = P.groundPlat;
+  P.onGround=false; P.groundPlat=null;
+  P.wallL=false; P.wallR=false;
+  P.onSlope=false; P.slopeObj=null;
+  platforms.forEach(pl => pl.occupied=false);
+
+  // Coyote time
+  if (wasGround && !P.onGround) P.coyoteT = COYOTE_T;
+  if (P.coyoteT > 0) P.coyoteT -= dt;
+
+  // Move H, resolve H
+  P.x += P.vx * TICK;
+  resolveH();
+
+  // Move V, resolve V
+  P.y += P.vy * TICK;
+  resolveV();
+
+  // Slope resolution
+  resolveSlopes();
+
+  // Execute jumps (after collision state is known)
+  if (P.jumpBufT > 0) {
+    if (P.onGround || P.coyoteT > 0) {
+      // Ground / coyote jump
+      P.vy = JUMP_V;
+      P.onGround=false; P.coyoteT=0; P.jumpBufT=0;
+      spawnParts(P.x+P.w/2, P.y+P.h, 6, '#ffffff90');
+    } else if ((P.wallL || P.wallR) && !wasGround) {
+      // Wall jump
+      P.vy = JUMP_V + 0.8;
+      P.vx = P.wallR ? -WALL_JUMP_VX : WALL_JUMP_VX;
+      P.jumpBufT=0; P.wallL=false; P.wallR=false;
+      spawnParts(P.x+P.w/2, P.y+P.h/2, 7, '#aaddff90');
+    }
+  }
+  if (P.jumpBufT > 0) P.jumpBufT -= dt;
+
+  // Camera lerp
+  const targetCam = P.x + P.w/2 - W*0.37;
+  camX = clamp(lerp(camX, targetCam, 0.10), 0, lvlWidth - W);
+
+  checkHazards();
+}
+
+function resolveH() {
+  const hObstacles = [...platforms.filter(p=>!p.sunk), ...walls];
+  hObstacles.forEach(ob => {
+    if (!ov(P.x,P.y+2,P.w,P.h-4, ob.x,ob.y,ob.w,ob.h)) return;
+    if (P.vx >= 0 && P.x+P.w > ob.x && P.x < ob.x) {
+      P.x = ob.x-P.w; P.wallR=true; P.vx=0;
+    } else if (P.vx <= 0 && P.x < ob.x+ob.w && P.x+P.w > ob.x+ob.w) {
+      P.x = ob.x+ob.w; P.wallL=true; P.vx=0;
+    }
+  });
+  // Level bounds
+  if (P.x < 0)          { P.x=0;          P.wallL=true; P.vx=0; }
+  if (P.x+P.w > lvlWidth) { P.x=lvlWidth-P.w; P.wallR=true; P.vx=0; }
+}
+
+function resolveV() {
+  platforms.forEach(pl => {
+    if (pl.sunk) return;
+    if (!ov(P.x+2,P.y,P.w-4,P.h, pl.x,pl.y,pl.w,pl.h)) return;
+    if (P.vy >= 0 && P.y+P.h-P.vy*2 <= pl.y+4) {
+      // Land on top
+      P.y = pl.y - P.h; P.onGround=true; P.groundPlat=pl;
+      if (pl.type==='bouncy') {
+        P.vy=BOUNCE_V; P.onGround=false; P.groundPlat=null;
+        pl.bouncedT=0.25;
+        spawnParts(P.x+P.w/2, P.y+P.h, 10, '#50ff8090');
+      } else {
+        P.vy=0;
+        if (pl.type==='sinking') pl.occupied=true;
+      }
+    } else if (P.vy < 0 && P.y > pl.y+pl.h-6) {
+      // Bonk ceiling
+      P.y = pl.y+pl.h; P.vy=0;
+    }
+  });
+  // Walls: can land on top or bonk underside
+  walls.forEach(w => {
+    if (!ov(P.x+2,P.y,P.w-4,P.h, w.x,w.y,w.w,w.h)) return;
+    if (P.vy >= 0 && P.y+P.h-P.vy*2 <= w.y+4) {
+      P.y = w.y - P.h; P.onGround=true; P.vy=0;
+    } else if (P.vy < 0 && P.y > w.y+w.h-6) {
+      P.y = w.y+w.h; P.vy=0;
+    }
+  });
+}
+
+function resolveSlopes() {
+  slopes.forEach(sl => {
+    const pcx = P.x + P.w/2;
+    if (pcx < sl.x || pcx > sl.x+sl.w) return;
+    const surfY = slopeSurfY(sl, pcx);
+    if (P.y+P.h >= surfY-4 && P.y+P.h <= surfY+28 && P.vy >= 0) {
+      P.y = surfY - P.h; P.vy=0;
+      P.onGround=true; P.onSlope=true; P.slopeObj=sl;
+    }
+  });
+}
+
+function checkHazards() {
+  if (P.dead) return;
+  if (P.y+P.h >= LAVA_TOP) { killPlayer('lava'); return; }
+  smashers.forEach(sm => { if (sm.crushesPlayer()) killPlayer('smasher'); });
+  spikers.forEach(sp => {
+    if (ov(P.x,P.y,P.w,P.h, sp.x,sp.y+sp.h,sp.w,18)) killPlayer('spike');
+  });
+  if (wMonster?.active && ov(P.x,P.y,P.w,P.h, wMonster.x,0,wMonster.w,H)) {
+    killPlayer('monster');
+  }
+  // End platform: trigger when player's center-x is within the platform and
+  // their feet are within 2 player-heights of the surface (no onGround required
+  // — jump buffer can clear onGround the same frame the player lands)
+  const ep = platforms.find(p=>p.type==='end');
+  if (ep && P.x + P.w/2 > ep.x + 15 && P.x + P.w/2 < ep.x + ep.w - 15
+      && P.y + P.h > ep.y - P.h && P.y + P.h <= ep.y + ep.h + 4) {
+    completeLevel();
+  }
+}
+
+function killPlayer(cause) {
+  if (P.dead) return;
+  P.dead=true;
+  const col = cause==='lava' ? '#ff6600' : cause==='spike' ? '#cc0044' : '#ff2200';
+  spawnParts(P.x+P.w/2, P.y+P.h/2, 22, col);
+  gState='dying'; dyingTimer=1.6;
+}
+
+function completeLevel() {
+  if (gState!=='playing') return;
+  spawnParts(P.x+P.w/2, P.y+P.h/2, 20, '#ffcc00');
+  gState='levelComplete'; lvlTimer=2.2; levelsCleared++;
+}
+
+// ── SINKING PLATFORM UPDATE ───────────────────────────────────────────────────
+function updateSinking(dt) {
+  platforms.forEach(pl => {
+    if (pl.type!=='sinking' || pl.sunk) return;
+    if (pl.bouncedT>0) pl.bouncedT=Math.max(0,pl.bouncedT-dt);
+    if (pl.occupied) {
+      pl.sinkT += dt;
+      pl.shakeX = pl.sinkT > pl.sinkDelay*0.25 ? Math.sin(gTime*35)*3 : 0;
+      if (pl.sinkT > pl.sinkDelay) { pl.y += 950*dt; if(pl.y>LAVA_TOP+110) pl.sunk=true; }
+    } else if (pl.sinkT < pl.sinkDelay) {
+      pl.sinkT = Math.max(0, pl.sinkT-dt*1.8);
+      pl.y     = Math.min(pl.origY, pl.y + 45*dt);
+      if (pl.sinkT===0) pl.shakeX=0;
+    }
+    if (pl.bouncedT>0) pl.bouncedT=Math.max(0,pl.bouncedT-dt);
+  });
+  platforms.forEach(pl => { if(pl.type==='bouncy' && pl.bouncedT>0) pl.bouncedT=Math.max(0,pl.bouncedT-dt); });
+}
+
+// ── MONSTER UPDATE ────────────────────────────────────────────────────────────
+function updateMonster(dt) {
+  if (!wMonster) return;
+  wMonster.timer += dt;
+  if (!wMonster.active) {
+    if (wMonster.timer >= wMonster.activateAt) {
+      wMonster.active=true;
+      wMonster.x = camX - wMonster.w - 10;
+    } else if (wMonster.timer > wMonster.activateAt-2.5) {
+      wMonster.warned=true; wMonster.warningT+=dt;
+    }
+  }
+  if (wMonster.active) wMonster.x += wMonster.speed * dt;
+}
+
+// ── DRAW ─────────────────────────────────────────────────────────────────────
+function draw() {
+  // Sky
+  const sky = ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,   '#0b0208');
+  sky.addColorStop(0.55,'#260505');
+  sky.addColorStop(1,   '#5c0e00');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,W,H);
+
+  // Background shimmer streaks
+  ctx.strokeStyle='rgba(255,50,0,0.04)'; ctx.lineWidth=1.5;
+  for (let i=0;i<7;i++) {
+    const sx=((gTime*28*(i%2?1.2:0.8)+i*157)%lvlWidth)-camX;
+    ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx-50,H); ctx.stroke();
+  }
+
+  drawSlopes();
+  drawWalls();
+  smashers.forEach(sm=>sm.draw());
+  drawPlatforms();  // drawn after smashers so platforms always show on top
+  drawSpikers();
+  drawParts();
+  if (!P.dead) drawPlayer();
+  drawMonster();
+  drawLava();
+  drawUI();
+  drawOverlay();
+}
+
+function drawPlatforms() {
+  platforms.forEach(pl => {
+    if (pl.sunk) return;
+    const sx = pl.x - camX + (pl.shakeX||0), sy=pl.y;
+
+    if (pl.type==='end') {
+      ctx.shadowColor='#ffcc00'; ctx.shadowBlur=18;
+      ctx.fillStyle='#c8a200';
+      ctx.fillRect(sx,sy,pl.w,pl.h);
+      ctx.fillStyle='#ffe840';
+      ctx.fillRect(sx,sy,pl.w,5);
+      ctx.shadowBlur=0;
+      ctx.fillStyle='rgba(255,230,80,0.8)';
+      ctx.font='bold 12px Courier New'; ctx.textAlign='center';
+      ctx.fillText('FINISH', sx+pl.w/2, sy-7);
+      // Glow pulse
+      ctx.fillStyle=`rgba(255,220,0,${0.12+Math.sin(gTime*4)*0.08})`;
+      ctx.fillRect(sx-4, sy-4, pl.w+8, pl.h+8);
+      return;
+    }
+
+    if (pl.type==='static') {
+      ctx.fillStyle='#5a6778'; ctx.fillRect(sx,sy,pl.w,pl.h);
+      ctx.fillStyle='#7d8fa8'; ctx.fillRect(sx,sy,pl.w,5);
+      ctx.strokeStyle='#38404e'; ctx.lineWidth=1;
+      for(let bx=0;bx<pl.w;bx+=32) ctx.strokeRect(sx+bx,sy,32,pl.h);
+    }
+
+    if (pl.type==='sinking') {
+      const ratio=clamp(pl.sinkT/pl.sinkDelay,0,1);
+      const r=Math.floor(75+ratio*175), g=Math.floor(65-ratio*50);
+      ctx.fillStyle=`rgb(${r},${g},12)`; ctx.fillRect(sx,sy,pl.w,pl.h);
+      ctx.fillStyle=`rgba(255,110,0,${ratio*0.65})`; ctx.fillRect(sx,sy,pl.w,5);
+      if (ratio>0.35) {
+        ctx.strokeStyle=`rgba(255,40,0,${(ratio-0.35)/0.65})`;
+        ctx.lineWidth=1.5;
+        ctx.beginPath();
+        ctx.moveTo(sx+pl.w*0.28,sy); ctx.lineTo(sx+pl.w*0.18,sy+pl.h);
+        ctx.moveTo(sx+pl.w*0.72,sy); ctx.lineTo(sx+pl.w*0.82,sy+pl.h);
+        ctx.stroke();
+      }
+      // Timer bar above
+      if (pl.sinkT>0 && pl.sinkT<pl.sinkDelay) {
+        const remain=1-ratio;
+        ctx.fillStyle=`rgba(255,150,0,0.8)`;
+        ctx.fillRect(sx, sy-5, pl.w*remain, 3);
+      }
+    }
+
+    if (pl.type==='bouncy') {
+      const flash=pl.bouncedT>0;
+      ctx.fillStyle=flash?'#80ff90':'#1e7035';
+      ctx.fillRect(sx,sy+Math.floor(pl.h*0.5),pl.w,Math.ceil(pl.h*0.5));
+      ctx.fillStyle=flash?'#c0ffcc':'#3aae55';
+      for(let i=0;i+12<=pl.w;i+=14) {
+        ctx.fillRect(sx+i,sy, 10, Math.floor(pl.h*0.5));
+      }
+      ctx.fillStyle='#f0d800'; ctx.fillRect(sx,sy,pl.w,3);
+    }
+  });
+}
+
+function drawSlopes() {
+  slopes.forEach(sl => {
+    const sx=sl.x-camX, sy=sl.y;
+    ctx.fillStyle='#5a6778';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx+sl.w, sy+sl.h);
+    ctx.lineTo(sx+sl.w, sy+sl.h+22);
+    ctx.lineTo(sx, sy+sl.h+22);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='#8090a8'; ctx.lineWidth=3;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy); ctx.lineTo(sx+sl.w, sy+sl.h);
+    ctx.stroke();
+    ctx.fillStyle='rgba(255,255,120,0.45)';
+    ctx.font='12px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('↘ SLIDE', sx+sl.w/2, sy+sl.h/2+5);
+  });
+}
+
+function drawWalls() {
+  walls.forEach(w => {
+    const sx = w.x - camX, sy = w.y;
+    // Main body
+    ctx.fillStyle = '#4a5568';
+    ctx.fillRect(sx, sy, w.w, w.h);
+    // Left highlight
+    ctx.fillStyle = '#6a7a90';
+    ctx.fillRect(sx, sy, 4, w.h);
+    // Right shadow
+    ctx.fillStyle = '#2a333f';
+    ctx.fillRect(sx+w.w-4, sy, 4, w.h);
+    // Brick lines
+    ctx.strokeStyle = '#38404e'; ctx.lineWidth = 1;
+    for (let by = sy; by < sy+w.h; by += 18) ctx.strokeRect(sx, by, w.w, 18);
+    // Top cap
+    ctx.fillStyle = '#8090a8';
+    ctx.fillRect(sx-2, sy, w.w+4, 5);
+  });
+}
+
+function drawSpikers() {
+  spikers.forEach(sp => {
+    const sx=sp.x-camX, sy=sp.y;
+    ctx.fillStyle='#1a1a22'; ctx.fillRect(sx,sy,sp.w,sp.h);
+    ctx.fillStyle='#cc1818';
+    const sw=13, sh=18;
+    for (let ix=0; ix+sw<=sp.w; ix+=sw) {
+      ctx.beginPath();
+      ctx.moveTo(sx+ix, sy+sp.h);
+      ctx.lineTo(sx+ix+sw/2, sy+sp.h+sh);
+      ctx.lineTo(sx+ix+sw, sy+sp.h);
+      ctx.fill();
+    }
+    // Warning glow
+    ctx.fillStyle='rgba(200,0,0,0.1)';
+    ctx.fillRect(sx, sy, sp.w, sp.h+sh+10);
+  });
+}
+
+function drawPlayer() {
+  const sx=Math.round(P.x-camX), sy=Math.round(P.y);
+  const scaleX = P.facingR ? 1 : -1;
+  const cr = P.crouching;
+  ctx.save();
+  // Anchor to feet so crouch shrinks upward
+  ctx.translate(sx+P.w/2, sy+P.h);
+  ctx.scale(scaleX, 1);
+
+  const leg = P.onGround && !cr ? Math.sin(gTime*9)*5 : 0;
+  const fh = P.h; // current effective height
+
+  // Shadow
+  ctx.fillStyle='rgba(0,0,0,0.25)';
+  ctx.fillRect(-10, 2, 22, 4);
+
+  if (cr) {
+    // Crouched: squashed body, no legs visible, head tucked
+    ctx.fillStyle='#2d68cc';
+    ctx.fillRect(-11, -fh+2, 22, fh-2);
+    ctx.fillStyle='#1a48a0';
+    ctx.fillRect(-11, -fh+2, 4, fh-2);
+    ctx.fillStyle='#f0c068';
+    ctx.fillRect(-8, -fh+2, 16, fh-6);
+    ctx.fillStyle='#5a3010';
+    ctx.fillRect(-8, -fh+2, 16, 4);
+    ctx.fillStyle='#111';
+    ctx.fillRect(2, -fh+7, 4, 3);
+  } else {
+    // Standing
+    ctx.fillStyle='#1a50a8';
+    ctx.fillRect(-10, -14+leg, 9, 14);
+    ctx.fillRect(1,   -14-leg, 9, 14);
+
+    ctx.fillStyle='#2d68cc';
+    ctx.fillRect(-11, -fh+14, 22, fh-28);
+
+    ctx.fillStyle='#1a48a0';
+    ctx.fillRect(-11, -fh+14, 4, fh-28);
+
+    ctx.fillStyle='#f0c068';
+    ctx.fillRect(-8, -fh, 16, 16);
+
+    ctx.fillStyle='#5a3010';
+    ctx.fillRect(-8, -fh, 16, 5);
+
+    ctx.fillStyle='#111';
+    ctx.fillRect(2, -fh+6, 4, 4);
+  }
+
+  // Sprint glow
+  if (isSprint() && P.stamina>0 && (isLeft()||isRight())) {
+    ctx.fillStyle='rgba(255,200,50,0.18)';
+    ctx.fillRect(-13, -fh-2, 26, fh+4);
+  }
+
+  // Wall slide sparks
+  if ((P.wallL||P.wallR) && !P.onGround && P.vy>0) {
+    ctx.fillStyle='rgba(150,200,255,0.4)';
+    const side = P.wallR ? 11 : -13;
+    for (let wy=0; wy<18; wy+=5) ctx.fillRect(side, -fh*0.6+wy, 3, 3);
+  }
+
+  ctx.restore();
+}
+
+function drawMonster() {
+  if (!wMonster) return;
+  // Warning
+  if (wMonster.warned && !wMonster.active) {
+    const a = (Math.sin(wMonster.warningT*6)+1)/2;
+    ctx.fillStyle=`rgba(200,0,0,${a*0.18})`; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='rgba(255,80,0,0.9)';
+    ctx.font='bold 16px Courier New'; ctx.textAlign='left';
+    const bang = Math.floor(wMonster.warningT*3)%2===0 ? '!! ' : '   ';
+    ctx.fillText(`${bang}WALL MONSTER INCOMING`, 14, 50);
+    return;
+  }
+  if (!wMonster.active) return;
+
+  const mx = wMonster.x - camX;
+  const grad=ctx.createLinearGradient(mx,0,mx+wMonster.w,0);
+  grad.addColorStop(0,'rgba(50,0,70,0.97)');
+  grad.addColorStop(1,'rgba(15,0,25,0.75)');
+  ctx.fillStyle=grad;
+  ctx.fillRect(mx,0,wMonster.w,H);
+
+  // Jagged right edge
+  ctx.fillStyle='rgba(35,0,50,0.9)';
+  ctx.beginPath();
+  ctx.moveTo(mx+wMonster.w, 0);
+  for (let ey=0; ey<H; ey+=25) {
+    ctx.lineTo(mx+wMonster.w+Math.sin(gTime*4+ey*0.09)*12+8, ey+12);
+    ctx.lineTo(mx+wMonster.w, ey+25);
+  }
+  ctx.lineTo(mx,H); ctx.lineTo(mx,0);
+  ctx.closePath(); ctx.fill();
+
+  // Eyes
+  const eg=(Math.sin(gTime*3)+1)/2;
+  ctx.fillStyle=`rgba(255,${Math.floor(eg*80)},0,0.95)`;
+  ctx.beginPath(); ctx.ellipse(mx+wMonster.w-14, H*0.33, 13,8,0,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(mx+wMonster.w-14, H*0.60, 13,8,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='rgba(255,255,100,0.9)';
+  ctx.beginPath(); ctx.arc(mx+wMonster.w-12, H*0.33, 4,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(mx+wMonster.w-12, H*0.60, 4,0,Math.PI*2); ctx.fill();
+}
+
+function drawLava() {
+  // Pre-glow
+  const glow=ctx.createLinearGradient(0,LAVA_TOP-40,0,LAVA_TOP);
+  glow.addColorStop(0,'rgba(255,80,0,0)');
+  glow.addColorStop(1,'rgba(255,60,0,0.2)');
+  ctx.fillStyle=glow; ctx.fillRect(0,LAVA_TOP-40,W,40);
+
+  // Wavy surface
+  ctx.fillStyle='#cc2800';
+  ctx.beginPath(); ctx.moveTo(0,LAVA_TOP);
+  for (let lx=0;lx<=W;lx+=3) {
+    const w1=Math.sin((lx+gTime*65)*0.038)*4.5;
+    const w2=Math.sin((lx-gTime*48)*0.065)*2;
+    ctx.lineTo(lx, LAVA_TOP+w1+w2);
+  }
+  ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.fill();
+
+  // Body
+  const lgrad=ctx.createLinearGradient(0,LAVA_TOP,0,H);
+  lgrad.addColorStop(0,'#ff4200');
+  lgrad.addColorStop(0.25,'#dd1e00');
+  lgrad.addColorStop(1,'#7a0000');
+  ctx.fillStyle=lgrad; ctx.fillRect(0,LAVA_TOP+6,W,H-LAVA_TOP);
+
+  // Bubbles
+  const bubbleData=[[1.2,0.15],[0.8,0.38],[1.4,0.55],[0.9,0.72],[1.1,0.88]];
+  bubbleData.forEach(([sp,offset],i) => {
+    const bx=(gTime*22*sp+offset*W)%W;
+    const by=LAVA_TOP+7+Math.sin(gTime*(1.5+i*0.4))*4;
+    const br=5+i*1.5;
+    ctx.fillStyle='#ff8c00';
+    ctx.beginPath(); ctx.arc(bx,by,br,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(255,200,0,0.6)';
+    ctx.beginPath(); ctx.arc(bx-br*0.3,by-br*0.3,br*0.4,0,Math.PI*2); ctx.fill();
+  });
+}
+
+function drawUI() {
+  // Lives (red squares)
+  for (let i=0;i<3;i++) {
+    ctx.fillStyle=i<lives?'#ee2222':'#331111';
+    ctx.fillRect(14+i*22, 14, 17, 17);
+    if (i<lives) {
+      ctx.fillStyle='#ff6666';
+      ctx.fillRect(16+i*22,16,6,5);
+    }
+  }
+  ctx.fillStyle='#ff5555'; ctx.font='11px Courier New'; ctx.textAlign='left';
+  ctx.fillText('LIVES', 14, 42);
+
+  // Level
+  ctx.fillStyle='#ffcc44'; ctx.font='bold 17px Courier New'; ctx.textAlign='center';
+  ctx.fillText(`LEVEL  ${levelNum}`, W/2, 26);
+
+  // Stamina bar
+  const sbx=14, sby=H-22, sbw=145, sbh=10;
+  ctx.fillStyle='#222'; ctx.fillRect(sbx,sby,sbw,sbh);
+  const sr=P.stamina/100;
+  ctx.fillStyle=sr>0.5?'#22cc88':sr>0.2?'#eea800':'#cc1800';
+  ctx.fillRect(sbx,sby,sbw*sr,sbh);
+  ctx.strokeStyle='#555'; ctx.lineWidth=1; ctx.strokeRect(sbx,sby,sbw,sbh);
+  ctx.fillStyle='#aaa'; ctx.font='9px Courier New'; ctx.textAlign='left';
+  ctx.fillText('STAMINA', sbx, sby-3);
+
+  // Progress bar
+  const pbx=W/2-155, pby=H-22, pbw=310, pbh=8;
+  const prog=clamp((P.x-130)/(endPlatX-130),0,1);
+  ctx.fillStyle='#222'; ctx.fillRect(pbx,pby,pbw,pbh);
+  ctx.fillStyle='#3377ee'; ctx.fillRect(pbx,pby,pbw*prog,pbh);
+  ctx.strokeStyle='#555'; ctx.lineWidth=1; ctx.strokeRect(pbx,pby,pbw,pbh);
+  ctx.fillStyle='#ffcc00'; ctx.font='11px Courier New'; ctx.textAlign='left';
+  ctx.fillText('▶ START', pbx, pby-3);
+  ctx.textAlign='right';
+  ctx.fillText('FINISH ★', pbx+pbw, pby-3);
+
+  // Controls reminder (small, top right)
+  ctx.fillStyle='rgba(255,255,255,0.3)';
+  ctx.font='10px Courier New'; ctx.textAlign='right';
+  ctx.fillText('WASD/Arrows • SHIFT=Sprint • SPACE=Jump • Down+Slope=Slide', W-10, H-8);
+}
+
+function drawOverlay() {
+  if (gState==='dying') {
+    const a=1-dyingTimer/1.6;
+    ctx.fillStyle=`rgba(180,0,0,${a*0.45})`; ctx.fillRect(0,0,W,H);
+    if (dyingTimer<1.2) {
+      ctx.fillStyle=`rgba(255,255,255,${Math.min(1,(1.2-dyingTimer)/0.5)})`;
+      ctx.font='bold 48px Courier New'; ctx.textAlign='center';
+      ctx.fillText('YOU DIED', W/2, H/2);
+      ctx.font='20px Courier New';
+      ctx.fillStyle='rgba(255,200,200,0.8)';
+      ctx.fillText(`${lives-1} ${lives-1===1?'life':'lives'} remaining`, W/2, H/2+44);
+    }
+  }
+
+  if (gState==='levelComplete') {
+    const a=Math.min(1,(2.2-lvlTimer)/2.0);
+    ctx.fillStyle=`rgba(30,20,0,${a*0.45})`; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle=`rgba(255,230,50,${a})`;
+    ctx.font='bold 46px Courier New'; ctx.textAlign='center';
+    ctx.fillText('LEVEL CLEAR!', W/2, H/2-20);
+    ctx.font='20px Courier New'; ctx.fillStyle=`rgba(255,255,180,${a})`;
+    ctx.fillText(`Level ${levelNum} complete — ${levelsCleared} cleared so far`, W/2, H/2+28);
+  }
+
+  if (gState==='gameOver') {
+    ctx.fillStyle='rgba(0,0,0,0.78)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ff3333';
+    ctx.font='bold 56px Courier New'; ctx.textAlign='center';
+    ctx.fillText('GAME OVER', W/2, H/2-45);
+    ctx.fillStyle='#fff'; ctx.font='22px Courier New';
+    ctx.fillText(`You cleared  ${levelsCleared}  level${levelsCleared!==1?'s':''}`, W/2, H/2+15);
+    ctx.fillStyle='#aaa'; ctx.font='16px Courier New';
+    ctx.fillText('Press  SPACE  to try again', W/2, H/2+55);
+  }
+
+  if (gState==='menu') {
+    ctx.fillStyle='rgba(0,0,0,0.68)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ff6600';
+    ctx.font='bold 60px Courier New'; ctx.textAlign='center';
+    ctx.shadowColor='#ff3300'; ctx.shadowBlur=20;
+    ctx.fillText('FLOOR IS LAVA', W/2, 115);
+    ctx.shadowBlur=0;
+
+    ctx.fillStyle='#ffaa44';
+    ctx.font='bold 15px Courier New';
+    const lines=[
+      ['MOVE',     'Arrow Keys  /  WASD'],
+      ['SPRINT',   'SHIFT  (uses stamina, regenerates)'],
+      ['JUMP',     'SPACE / W / Up  (wall jump too!)'],
+      ['CROUCH',   'DOWN / S  — squeeze under gaps (hold)'],
+    ];
+    lines.forEach(([label,desc],i) => {
+      ctx.fillStyle='#ffcc44'; ctx.textAlign='right';
+      ctx.fillText(label, W/2-8, 195+i*30);
+      ctx.fillStyle='#ffeeaa'; ctx.textAlign='left';
+      ctx.fillText(desc, W/2+8, 195+i*30);
+    });
+
+    ctx.fillStyle='rgba(255,255,255,0.55)';
+    ctx.font='13px Courier New'; ctx.textAlign='center';
+    ctx.fillText('Reach the FINISH platform each level.  Avoid the lava, smashers, spikes, and the monster!', W/2, 325);
+    ctx.fillText('Platforms: GRAY = stable   ORANGE = sinking   GREEN = bouncy   RAMP = auto-slide boost', W/2, 345);
+
+    ctx.fillStyle='#ffe840';
+    ctx.font='bold 20px Courier New';
+    const blink=Math.sin(gTime*3)>0;
+    if (blink) ctx.fillText('Press  SPACE  to start', W/2, 400);
+  }
+}
+
+// ── MAIN LOOP ─────────────────────────────────────────────────────────────────
+let lastTime = 0;
+
+function loop(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  gTime += dt;
+
+  if (gState==='menu') {
+    if (jumpPr()) {
+      lives=3; levelNum=1; levelsCleared=0;
+      spawnLevel(levelNum);
+      gState='playing';
+    }
+  }
+  else if (gState==='playing') {
+    updatePhysics(dt);
+    updateSinking(dt);
+    smashers.forEach(sm=>sm.update(dt));
+    updateMonster(dt);
+    updateParts(dt);
+  }
+  else if (gState==='dying') {
+    dyingTimer -= dt;
+    updateParts(dt);
+    if (dyingTimer<=0) {
+      lives--;
+      if (lives<=0) { gState='gameOver'; }
+      else          { respawnPlayer(); gState='playing'; }
+    }
+  }
+  else if (gState==='levelComplete') {
+    lvlTimer -= dt;
+    updateParts(dt);
+    if (lvlTimer<=0) {
+      levelNum++;
+      spawnLevel(levelNum);
+      gState='playing';
+    }
+  }
+  else if (gState==='gameOver') {
+    if (jumpPr()) { gState='menu'; }
+  }
+
+  // Clear just-pressed
+  for (const k in KP) delete KP[k];
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// Kick off with menu-visible demo level
+spawnLevel(1);
+requestAnimationFrame(t => { lastTime=t; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>

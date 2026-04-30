@@ -153,10 +153,10 @@ document.addEventListener('keyup',   e => { keys[e.code] = false; });
 // ─── Player ───────────────────────────────────────────────────────────────────
 const WEAPONS = [
   { name: 'Fists',       icon: '👊', range: 38,  damage: 8,  cooldown: 25, color: '#f39c12', projSpeed: 0,  knockback: 10 },
-  { name: 'Club',        icon: '🪓', range: 50,  damage: 18, cooldown: 30, color: '#8B4513', projSpeed: 0,  knockback: 28 },
+  { name: 'Club',        icon: '🪓', range: 110, damage: 18, cooldown: 30, color: '#8B4513', projSpeed: 0,  knockback: 28 },
   { name: 'Spear',       icon: '🔱', range: 110, damage: 28, cooldown: 35, color: '#aaa',    projSpeed: 0,  knockback: 10 },
-  { name: 'Sword',       icon: '⚔️',  range: 60,  damage: 58, cooldown: 22, color: '#7ec8e3', projSpeed: 0,  knockback: 10 },
-  { name: 'Bow & Arrow', icon: '🏹', range: 350, damage: 30, cooldown: 40, color: '#c8a96e', projSpeed: 10, knockback: 8  },
+  { name: 'Sword',       icon: '⚔️',  range: 60,  damage: 35, cooldown: 22, color: '#7ec8e3', projSpeed: 0,  knockback: 10 },
+  { name: 'Bow & Arrow', icon: '🏹', range: 350, damage: 30, cooldown: 40, color: '#c8a96e', projSpeed: 10, knockback: 0  },
 ];
 
 let player;
@@ -329,14 +329,15 @@ function playerAttack() {
   // Melee: hit dinos in range/arc
   const cx = player.x + player.w / 2;
   const cy = player.y + player.h / 2;
+  const spear = w.name === 'Spear';
   dinos.forEach(d => {
     const dx = (d.x + d.size / 2) - cx;
     const dy = (d.y + d.size / 2) - cy;
     const dist = Math.hypot(dx, dy);
     if (dist < w.range + d.size / 2) {
-      // check facing arc (180 degrees in facing direction)
+      // Spear hits full 360; others check facing arc (180 degrees)
       const dot = dx * player.facing + dy * (player.facingY || 0);
-      if (dot > -20 || dist < w.range * 0.5) {
+      if (spear || dot > -20 || dist < w.range * 0.5) {
         d.hp -= w.damage;
         d.stunned = 20;
         // Knockback away from player
@@ -473,10 +474,7 @@ function update() {
       if (p.x > d.x && p.x < d.x + d.size && p.y > d.y && p.y < d.y + d.size) {
         d.hp -= p.damage;
         d.stunned = 15;
-        const plen = Math.hypot(p.dx, p.dy) || 1;
-        d.knockbackX = (p.dx / plen) * 4;
-        d.knockbackY = (p.dy / plen) * 4;
-        d.knockback = 8;
+        d.knockback = 0;
         spawnHitParticles(p.x, p.y, '#c8a96e');
         return false;
       }
@@ -1053,7 +1051,11 @@ function drawPlayer() {
     ctx.fillStyle = w.color;
     ctx.beginPath();
     const angle = Math.atan2(player.facingY || 0, player.facing);
-    ctx.arc(sx + player.w / 2, sy + player.h / 2, w.range, angle - Math.PI / 2, angle + Math.PI / 2);
+    if (w.name === 'Spear') {
+      ctx.arc(sx + player.w / 2, sy + player.h / 2, w.range, 0, Math.PI * 2);
+    } else {
+      ctx.arc(sx + player.w / 2, sy + player.h / 2, w.range, angle - Math.PI / 2, angle + Math.PI / 2);
+    }
     ctx.closePath();
     ctx.fill();
     ctx.restore();
